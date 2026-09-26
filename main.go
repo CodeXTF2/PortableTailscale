@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -45,8 +46,9 @@ type event struct {
 }
 
 type reporter struct {
-	json bool
-	mu   sync.Mutex
+	json  bool
+	color bool
+	mu    sync.Mutex
 }
 
 func (r *reporter) emit(e event) {
@@ -60,6 +62,8 @@ func (r *reporter) emit(e event) {
 
 	switch e.Event {
 	case "starting":
+		fmt.Println(header(r.color))
+		fmt.Println()
 		fmt.Printf("Starting Tailscale (state: %s)\n", e.StateDir)
 	case "auth":
 		fmt.Printf("Authenticate this device:\n%s\n", e.AuthURL)
@@ -77,6 +81,25 @@ func (r *reporter) emit(e event) {
 	}
 }
 
+// header draws the Tailscale logo (a 3x3 dot grid with the middle row and
+// bottom centre lit) beside the product name. Colours use ANSI escapes only
+// when color is true.
+func header(color bool) string {
+	paint := func(code, s string) string {
+		if !color {
+			return s
+		}
+		return "\x1b[" + code + "m" + s + "\x1b[0m"
+	}
+	on := paint("38;5;255", "●")
+	off := paint("38;5;240", "●")
+	return strings.Join([]string{
+		off + " " + off + " " + off,
+		on + " " + on + " " + on + "    " + paint("1;38;5;63", "Portable Tailscale"),
+		off + " " + on + " " + off,
+	}, "\n")
+}
+
 func main() {
 	os.Exit(run())
 }
@@ -87,7 +110,7 @@ func run() int {
 		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
-	report := &reporter{json: opts.json}
+	report := &reporter{json: opts.json, color: !opts.json && enableColor()}
 	if err := os.MkdirAll(opts.stateDir, 0700); err != nil {
 		report.emit(event{Event: "error", Message: fmt.Sprintf("create state directory: %v", err)})
 		return 1

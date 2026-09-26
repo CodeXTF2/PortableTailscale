@@ -289,9 +289,7 @@ func (m model) View() string {
 	}
 
 	var b strings.Builder
-	b.WriteString(titleStyle.Render("Portable Tailscale RDP"))
-	b.WriteString("\n")
-	b.WriteString(mutedStyle.Render("RDP through an embedded Tailscale SOCKS5 proxy"))
+	b.WriteString(banner())
 	b.WriteString("\n\n")
 	b.WriteString(m.row(targetField, "Computer", m.inputs[targetField].View()))
 	b.WriteString("\n")
@@ -327,6 +325,38 @@ func (m model) View() string {
 	}
 	b.WriteString("\n")
 	return lipgloss.NewStyle().Padding(1, 2).Render(b.String())
+}
+
+// banner draws a small Remote Desktop icon (monitor with a blue screen and a
+// green connection badge), an arrow, and the Tailscale logo beside the title.
+// Every part is vertically centred on the monitor.
+func banner() string {
+	bezel := lipgloss.NewStyle().Foreground(lipgloss.Color("250"))
+	screenTop := lipgloss.NewStyle().Foreground(lipgloss.Color("45")).Background(lipgloss.Color("33"))
+	screenBottom := lipgloss.NewStyle().Foreground(lipgloss.Color("33")).Background(lipgloss.Color("25"))
+	badge := lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true)
+
+	icon := strings.Join([]string{
+		bezel.Render("╭──────╮"),
+		bezel.Render("│") + screenTop.Render("▀▀▀▀▀▀") + bezel.Render("│"),
+		bezel.Render("│") + screenBottom.Render("▀▀▀▀▀▀") + bezel.Render("│"),
+		bezel.Render("╰──┬┬──╯") + badge.Render("⇄"),
+		bezel.Render("  ════"),
+	}, "\n")
+	arrow := badge.Render("──▶")
+	// Tailscale logo: a 3x3 dot grid with the middle row and bottom centre lit.
+	on := lipgloss.NewStyle().Foreground(lipgloss.Color("255")).Render("●")
+	off := lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("●")
+	logo := strings.Join([]string{
+		off + " " + off + " " + off,
+		on + " " + on + " " + on,
+		off + " " + on + " " + off,
+	}, "\n")
+	title := strings.Join([]string{
+		titleStyle.Render("Portable Tailscale RDP"),
+		mutedStyle.Render("RDP through Portable Tailscale"),
+	}, "\n")
+	return lipgloss.JoinHorizontal(lipgloss.Center, icon, "  ", arrow, "  ", logo, "    ", title)
 }
 
 func (m model) row(index int, label, value string) string {
