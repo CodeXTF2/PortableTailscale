@@ -33,7 +33,6 @@ client.
 2. Put `sdl-freerdp.exe` in the `freerdp` folder. Download the official
    64-bit static build from the
    [FreeRDP nightly CI](https://ci.freerdp.com/job/freerdp-nightly-windows/lastSuccessfulBuild/arch%3Dwin64%2Clabel%3Dvs2017/artifact/install/bin/sdl-freerdp.exe)
-   (see [FREERDP.md](FREERDP.md) for the tested version and checksum).
 3. Open `PortableTailscaleRDP.exe`.
 4. Enter the tailnet computer, Windows username, optional domain, and password.
 5. Move to **Connect** and press Enter.
