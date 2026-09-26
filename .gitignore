@@ -1,0 +1,64 @@
+# Go build output
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.a
+*.o
+*.obj
+*.lib
+*.pdb
+*.test
+*.out
+.coverprofile
+coverage.*
+/bin/
+/build/
+/dist/
+/tmp/
+
+# Keep the bundled FreeRDP client in the repository
+!/freerdp/sdl-freerdp.exe
+
+# Local Go workspace
+go.work
+go.work.sum
+
+# Portable Tailscale identity and cached tailnet data
+/data/
+*.state
+tailscaled.log*
+profile-data/
+
+# Credentials and machine-local configuration
+.env
+.env.*
+!.env.example
+*.local
+*.secret
+*.secrets
+*.key
+*.pem
+*.pfx
+*.p12
+*.rdp
+
+# Logs, traces, and crash dumps
+*.log
+*.log.*
+*.trace
+*.dmp
+*.dump
+
+# Editors and operating systems
+.idea/
+.vscode/
+.vs/
+*.suo
+*.user
+*.swp
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
