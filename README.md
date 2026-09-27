@@ -73,8 +73,7 @@ go build -trimpath -ldflags="-s -w" -o PortableTailscaleRDP.exe .\cmd\tui
 The RDP example also needs a Windows x64 build of `sdl-freerdp.exe`, available
 from the
 [FreeRDP nightly CI](https://ci.freerdp.com/job/freerdp-nightly-windows/lastSuccessfulBuild/arch%3Dwin64%2Clabel%3Dvs2017/artifact/install/bin/sdl-freerdp.exe)
-([FreeRDP project](https://github.com/FreeRDP/FreeRDP)). See
-[FREERDP.md](FREERDP.md) for the version and SHA-256 used during development.
+([FreeRDP project](https://github.com/FreeRDP/FreeRDP)).
 
 ## Files
 
