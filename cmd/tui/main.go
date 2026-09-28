@@ -16,11 +16,12 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
+	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	xproxy "golang.org/x/net/proxy"
@@ -41,34 +42,54 @@ type sessionConfig struct {
 	password   string
 	clipboard  bool
 	fullscreen bool
+	options    *rdpOptions
 }
 
 type sessionEvent struct {
 	status string
 	err    error
 	done   bool
-	exit   bool
+	stage  string
+	log    string
 }
 
 type model struct {
-	inputs       []textinput.Model
-	focus        int
-	clipboard    bool
-	fullscreen   bool
-	status       string
-	running      bool
-	quitting     bool
-	exitWhenDone bool
-	spinner      spinner.Model
-	cancel       context.CancelFunc
-	events       <-chan sessionEvent
+	inputs         []textinput.Model
+	focus          int
+	clipboard      bool
+	fullscreen     bool
+	status         string
+	running        bool
+	quitting       bool
+	exitWhenDone   bool
+	spinner        spinner.Model
+	cancel         context.CancelFunc
+	events         <-chan sessionEvent
+	width, height  int
+	screen         string
+	stage          string
+	started        time.Time
+	logs           []string
+	diagnostics    viewport.Model
+	profiles       []profile
+	profileList    list.Model
+	profileName    textinput.Model
+	profilePath    string
+	profileLoadErr error
+	deleteName     string
+	proxy          *portableProxy
+	proxyStarting  bool
+	proxyStatus    string
+	tab            int
+	options        rdpOptions
+	folder         textinput.Model
 }
 
 var (
-	titleStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("63"))
-	labelStyle   = lipgloss.NewStyle().Width(24).Foreground(lipgloss.Color("245"))
-	focusedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("212")).Bold(true)
-	mutedStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	titleStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.AdaptiveColor{Light: "25", Dark: "81"})
+	labelStyle   = lipgloss.NewStyle().Width(19).Foreground(lipgloss.AdaptiveColor{Light: "238", Dark: "250"})
+	focusedStyle = titleStyle
+	mutedStyle   = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "242", Dark: "245"})
 	errorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
 )
 
@@ -84,6 +105,7 @@ const (
 )
 
 func main() {
+	configureColors()
 	if len(os.Args) == 2 && os.Args[1] == "--smoke-test" {
 		m := initialModel()
 		if strings.TrimSpace(m.View()) == "" {
@@ -94,8 +116,14 @@ func main() {
 
 	_ = killChildrenOnExit()
 
-	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
-	if _, err := p.Run(); err != nil {
+	m := initialModel()
+	p := tea.NewProgram(m, tea.WithAltScreen())
+	final, err := p.Run()
+	if finalModel, ok := final.(model); ok {
+		finalModel.proxy.close()
+	}
+	m.proxy.close()
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "Portable Tailscale RDP:", err)
 		os.Exit(1)
 	}
@@ -129,60 +157,198 @@ func initialModel() model {
 	spin.Spinner = spinner.Dot
 	spin.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("212"))
 
-	return model{
+	m := model{
 		inputs:    []textinput.Model{target, username, domain, password},
 		clipboard: true,
 		status:    "Ready",
 		spinner:   spin,
+		width:     80, height: 24, stage: "Ready",
+		proxy: newPortableProxy(), proxyStarting: true, proxyStatus: "Starting Tailscale…",
 	}
+	for i := range m.inputs {
+		m.inputs[i].Prompt = ""
+		m.inputs[i].TextStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "235", Dark: "255"})
+		m.inputs[i].PlaceholderStyle = mutedStyle
+		m.inputs[i].Cursor.Style = focusedStyle
+	}
+	m.initOptions()
+	m.initWorkspace()
+	return m
 }
 
-func (m model) Init() tea.Cmd { return textinput.Blink }
+func (m model) Init() tea.Cmd {
+	return tea.Batch(textinput.Blink, startPortableProxy(m.proxy), waitForPortableProxy(m.proxy), m.spinner.Tick)
+}
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
-	case spinner.TickMsg:
+	case proxyMessage:
+		if msg.proxy != m.proxy {
+			return m, nil
+		}
+		if msg.event.log != "" {
+			m.addLog(msg.event.log)
+		}
+		if msg.event.status != "" {
+			m.proxyStatus = msg.event.status
+			m.addLog(msg.event.status)
+		}
+		if msg.event.stage == "Ready" {
+			m.proxyStarting = false
+		}
+		if msg.event.done {
+			m.proxyStarting = false
+			m.proxyStatus = "Tailscale stopped · Connect retries"
+			if msg.event.err != nil && !errors.Is(msg.event.err, context.Canceled) {
+				m.proxyStatus = "Tailscale error · Connect retries"
+				m.addLog(msg.event.err.Error())
+				if !m.running {
+					m.status = "Error: " + redact(msg.event.err.Error())
+				}
+			}
+			return m, nil
+		}
+		return m, waitForPortableProxy(m.proxy)
+	case tea.WindowSizeMsg:
+		m.resize(msg.Width, msg.Height)
+		return m, nil
+	case clockTick:
 		if m.running {
+			return m, sessionTick()
+		}
+		return m, nil
+	case spinner.TickMsg:
+		if m.running || m.proxyStarting {
 			var cmd tea.Cmd
 			m.spinner, cmd = m.spinner.Update(msg)
 			return m, cmd
 		}
 	case sessionEvent:
+		if msg.log != "" {
+			m.addLog(msg.log)
+		}
+		if msg.stage != "" {
+			m.stage = msg.stage
+		}
 		if msg.done {
 			m.running = false
 			m.cancel = nil
 			m.events = nil
-			if msg.exit || m.exitWhenDone {
+			if m.exitWhenDone {
 				m.quitting = true
 				return m, tea.Quit
 			}
 			if msg.err != nil && !errors.Is(msg.err, context.Canceled) {
-				m.status = "Error: " + msg.err.Error()
+				m.status = "Error: " + redact(msg.err.Error(), m.inputs[passwordField].Value())
 			} else if errors.Is(msg.err, context.Canceled) {
 				m.status = "Disconnected"
 			} else {
 				m.status = "Remote Desktop closed"
 			}
-			m.setFocus(0)
+			m.stage = "Ready"
+			if msg.err != nil && !errors.Is(msg.err, context.Canceled) {
+				m.stage = "Failed"
+			}
+			m.addLog(m.status)
+			m.setFocus(connectField)
+			if errors.Is(msg.err, errLogonFailed) {
+				m.tab = 0
+				m.setFocus(passwordField)
+			}
 			return m, nil
 		}
 		if msg.status != "" {
 			m.status = msg.status
+			if password := m.inputs[passwordField].Value(); password != "" {
+				m.status = strings.ReplaceAll(m.status, password, "[redacted]")
+			}
+			if strings.Contains(msg.status, "authentication") {
+				m.stage = "Awaiting authentication"
+			}
+			m.addLog(msg.status)
 		}
 		return m, waitForSessionEvent(m.events)
 	case tea.KeyMsg:
+		if msg.String() == "ctrl+c" {
+			return m.quit()
+		}
+		if m.screen != "" {
+			return m.updateScreen(msg)
+		}
 		switch msg.String() {
+		case "f1", "f2", "f3", "f4":
+			if !m.running {
+				m.switchTab(int(msg.String()[1] - '1'))
+			}
+			return m, nil
+		case "ctrl+left", "ctrl+right":
+			if !m.running {
+				delta := 1
+				if msg.String() == "ctrl+left" {
+					delta = -1
+				}
+				m.switchTab(m.tab + delta)
+			}
+			return m, nil
+		case "left", "right":
+			if !m.running && isOptionField(m.focus) {
+				delta := 1
+				if msg.String() == "left" {
+					delta = -1
+				}
+				m.adjustOption(delta)
+				return m, nil
+			}
+		case "ctrl+p":
+			if !m.running {
+				m.screen = "profiles"
+				m.refreshProfiles()
+			}
+			return m, nil
+		case "ctrl+s":
+			if !m.running {
+				m.screen = "save"
+				// Suggest the computer name without pre-typing it, so typing starts a
+				// fresh custom name and a blank Enter still accepts the suggestion.
+				m.profileName.Placeholder = "Profile name"
+				if target := strings.TrimSpace(m.inputs[targetField].Value()); target != "" {
+					m.profileName.Placeholder = target
+				}
+				m.profileName.CursorEnd()
+				return m, m.profileName.Focus()
+			}
+			return m, nil
+		case "ctrl+n":
+			if !m.running {
+				m.initOptions()
+				m.resize(m.width, m.height)
+				m.tab = 0
+				m.profileName.SetValue("")
+				for i := range m.inputs {
+					m.inputs[i].SetValue("")
+				}
+				m.clipboard = true
+				m.fullscreen = false
+				m.status = "New connection"
+				m.setFocus(0)
+			}
+			return m, nil
+		case "ctrl+l":
+			m.screen = "logs"
+			return m, nil
 		case "ctrl+c":
 			return m.quit()
 		case "esc":
+			if m.running {
+				m.cancel()
+				m.stage = "Stopping"
+				m.status = "Disconnecting..."
+				return m, nil
+			}
 			return m.quit()
-		case "tab", "shift+tab":
+		case "tab":
 			if !m.running {
-				delta := 1
-				if msg.String() == "shift+tab" {
-					delta = -1
-				}
-				m.setFocus((m.focus + delta + focusCount) % focusCount)
+				m.switchTab(m.tab + 1)
 			}
 			return m, nil
 		case "up", "down":
@@ -191,24 +357,43 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if msg.String() == "down" {
 					delta = 1
 				}
-				m.setFocus((m.focus + delta + focusCount) % focusCount)
+				m.moveFocus(delta)
 				return m, nil
 			}
 		case "enter":
 			if !m.running {
 				if m.focus != connectField {
-					m.setFocus((m.focus + 1) % focusCount)
+					m.moveFocus(1)
 					return m, nil
 				}
 				return m.activateFocused()
 			}
 		case " ":
-			if !m.running && (m.focus == clipboardField || m.focus == fullscreenField) {
-				return m.activateFocused()
+			if !m.running && isOptionField(m.focus) {
+				m.adjustOption(1)
+				return m, nil
 			}
 		}
 	}
 
+	if m.screen == "profiles" {
+		var cmd tea.Cmd
+		m.profileList, cmd = m.profileList.Update(msg)
+		return m, cmd
+	}
+	if m.screen == "save" {
+		var cmd tea.Cmd
+		m.profileName, cmd = m.profileName.Update(msg)
+		return m, cmd
+	}
+	if m.screen != "" {
+		return m, nil
+	}
+	if !m.running && m.focus == folderField {
+		var cmd tea.Cmd
+		m.folder, cmd = m.folder.Update(msg)
+		return m, cmd
+	}
 	if !m.running && m.focus < len(m.inputs) {
 		var cmd tea.Cmd
 		m.inputs[m.focus], cmd = m.inputs[m.focus].Update(msg)
@@ -228,14 +413,21 @@ func (m model) activateFocused() (tea.Model, tea.Cmd) {
 	case connectField:
 		target := strings.TrimSpace(m.inputs[targetField].Value())
 		if target == "" {
+			m.tab = 0
 			m.status = "Error: enter a Tailscale computer name or IP address"
 			m.setFocus(targetField)
 			return m, nil
 		}
 		username := strings.TrimSpace(m.inputs[usernameField].Value())
 		if username == "" {
+			m.tab = 0
 			m.status = "Error: enter the Windows username"
 			m.setFocus(usernameField)
+			return m, nil
+		}
+		options := m.currentOptions()
+		if err := validateRDPOptions(options); err != nil {
+			m.status = "Error: " + err.Error()
 			return m, nil
 		}
 		config := sessionConfig{
@@ -245,6 +437,13 @@ func (m model) activateFocused() (tea.Model, tea.Cmd) {
 			password:   m.inputs[passwordField].Value(),
 			clipboard:  m.clipboard,
 			fullscreen: m.fullscreen,
+			options:    &options,
+		}
+		for _, value := range []string{config.target, config.username, config.domain, config.password} {
+			if strings.ContainsAny(value, "\r\n") {
+				m.status = "Error: connection fields cannot contain line breaks"
+				return m, nil
+			}
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		events := make(chan sessionEvent, 16)
@@ -252,17 +451,39 @@ func (m model) activateFocused() (tea.Model, tea.Cmd) {
 		m.events = events
 		m.running = true
 		m.exitWhenDone = false
-		m.status = "Starting portable Tailscale..."
+		m.status = "Preparing Remote Desktop..."
+		m.stage = "Starting"
+		m.started = time.Now()
+		m.addLog("Starting connection to " + target)
 		for i := range m.inputs {
 			m.inputs[i].Blur()
 		}
-		return m, tea.Batch(startSession(ctx, config, events), m.spinner.Tick)
+		m.folder.Blur()
+		var proxyCmd tea.Cmd
+		var spinCmd tea.Cmd
+		if !m.proxyStarting {
+			spinCmd = m.spinner.Tick
+		}
+		select {
+		case <-m.proxy.done:
+			m.proxy = newPortableProxy()
+			m.proxyStarting = true
+			m.proxyStatus = "Starting Tailscale…"
+			proxyCmd = tea.Batch(startPortableProxy(m.proxy), waitForPortableProxy(m.proxy))
+		default:
+		}
+		return m, tea.Batch(startSession(ctx, config, events, m.proxy), spinCmd, sessionTick(), proxyCmd)
 	}
 	return m, nil
 }
 
 func (m *model) setFocus(index int) {
 	m.focus = index
+	if index == folderField {
+		m.folder.Focus()
+	} else {
+		m.folder.Blur()
+	}
 	for i := range m.inputs {
 		if i == index {
 			m.inputs[i].Focus()
@@ -276,6 +497,7 @@ func (m model) quit() (tea.Model, tea.Cmd) {
 	if m.running && m.cancel != nil {
 		m.cancel()
 		m.exitWhenDone = true
+		m.stage = "Stopping"
 		m.status = "Disconnecting..."
 		return m, nil
 	}
@@ -283,55 +505,11 @@ func (m model) quit() (tea.Model, tea.Cmd) {
 	return m, tea.Quit
 }
 
-func (m model) View() string {
-	if m.quitting {
-		return ""
-	}
-
-	var b strings.Builder
-	b.WriteString(banner())
-	b.WriteString("\n\n")
-	b.WriteString(m.row(targetField, "Computer", m.inputs[targetField].View()))
-	b.WriteString("\n")
-	b.WriteString(m.row(usernameField, "Username", m.inputs[usernameField].View()))
-	b.WriteString("\n")
-	b.WriteString(m.row(domainField, "Domain (optional)", m.inputs[domainField].View()))
-	b.WriteString("\n")
-	b.WriteString(m.row(passwordField, "Password", m.inputs[passwordField].View()))
-	b.WriteString("\n\n")
-	b.WriteString(m.row(clipboardField, "Share clipboard", checkbox(m.clipboard)))
-	b.WriteString("\n")
-	b.WriteString(m.row(fullscreenField, "Full screen", checkbox(m.fullscreen)))
-	b.WriteString("\n\n")
-	b.WriteString(m.row(connectField, "", "[ Connect ]"))
-	b.WriteString("\n\n")
-
-	status := m.status
-	if m.running {
-		status = m.spinner.View() + " " + status
-	}
-	if strings.HasPrefix(m.status, "Error:") {
-		b.WriteString(errorStyle.Render(status))
-	} else {
-		b.WriteString(status)
-	}
-	b.WriteString("\n\n")
-	if m.running {
-		b.WriteString(mutedStyle.Render("Esc: disconnect  |  Ctrl+C: exit"))
-	} else {
-		b.WriteString(mutedStyle.Render("Up/Down or Tab/Shift+Tab: move"))
-		b.WriteString("\n")
-		b.WriteString(mutedStyle.Render("Enter: next/connect  |  Space: toggle  |  Esc: exit"))
-	}
-	b.WriteString("\n")
-	return lipgloss.NewStyle().Padding(1, 2).Render(b.String())
-}
-
 // banner draws a small Remote Desktop icon (monitor with a blue screen and a
 // green connection badge), an arrow, and the Tailscale logo beside the title.
 // Every part is vertically centred on the monitor.
 func banner() string {
-	bezel := lipgloss.NewStyle().Foreground(lipgloss.Color("250"))
+	bezel := lipgloss.NewStyle().Foreground(accentColor)
 	screenTop := lipgloss.NewStyle().Foreground(lipgloss.Color("45")).Background(lipgloss.Color("33"))
 	screenBottom := lipgloss.NewStyle().Foreground(lipgloss.Color("33")).Background(lipgloss.Color("25"))
 	badge := lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true)
@@ -346,7 +524,7 @@ func banner() string {
 	arrow := badge.Render("──▶")
 	// Tailscale logo: a 3x3 dot grid with the middle row and bottom centre lit.
 	on := lipgloss.NewStyle().Foreground(lipgloss.Color("255")).Render("●")
-	off := lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("●")
+	off := mutedStyle.Render("●")
 	logo := strings.Join([]string{
 		off + " " + off + " " + off,
 		on + " " + on + " " + on,
@@ -354,7 +532,7 @@ func banner() string {
 	}, "\n")
 	title := strings.Join([]string{
 		titleStyle.Render("Portable Tailscale RDP"),
-		mutedStyle.Render("RDP through Portable Tailscale"),
+		sectionStyle.Render("RDP through Portable Tailscale"),
 	}, "\n")
 	return lipgloss.JoinHorizontal(lipgloss.Center, icon, "  ", arrow, "  ", logo, "    ", title)
 }
@@ -365,102 +543,108 @@ func (m model) row(index int, label, value string) string {
 	if m.focus == index && !m.running {
 		pointer = "> "
 		style = focusedStyle
+		value = focusedStyle.Render(value)
 	}
-	return style.Render(pointer) + labelStyle.Render(label) + value
+	labels := labelStyle
+	if m.focus == index && !m.running {
+		labels = labels.Foreground(accentColor).Bold(true).Background(lipgloss.AdaptiveColor{Light: "153", Dark: "24"})
+	}
+	if index == connectField {
+		if m.focus == index && !m.running {
+			value = selectedButtonStyle.Render("[ Connect / Retry ]")
+		} else {
+			value = buttonStyle.Render("[ Connect / Retry ]")
+		}
+	}
+	if m.width < 65 {
+		labels = labels.Width(12)
+		if index == domainField {
+			label = "Domain"
+		}
+		if index == clipboardField {
+			label = "Clipboard"
+		}
+	}
+	return style.Render(pointer) + labels.Render(label) + value
 }
 
 func checkbox(checked bool) string {
 	if checked {
-		return "[x]"
+		return successStyle.Bold(true).Render("[✓] ON")
 	}
-	return "[ ]"
+	return mutedStyle.Render("[ ] OFF")
 }
 
-func startSession(ctx context.Context, config sessionConfig, events chan sessionEvent) tea.Cmd {
+func startSession(ctx context.Context, config sessionConfig, events chan sessionEvent, proxy *portableProxy) tea.Cmd {
 	return func() tea.Msg {
-		go runSession(ctx, config, events)
+		go runSession(ctx, config, events, proxy)
 		return <-events
 	}
 }
 
 func waitForSessionEvent(events <-chan sessionEvent) tea.Cmd {
+	if events == nil {
+		return nil
+	}
 	return func() tea.Msg { return <-events }
 }
 
-func runSession(ctx context.Context, config sessionConfig, events chan<- sessionEvent) {
+func runSession(ctx context.Context, config sessionConfig, events chan<- sessionEvent, proxy *portableProxy) {
 	var finalErr error
-	var rdpStarted bool
-	defer func() { events <- sessionEvent{err: finalErr, done: true, exit: rdpStarted} }()
-	emit := func(status string) { events <- sessionEvent{status: status} }
-
-	baseDir, err := executableDirectory()
+	defer func() { events <- sessionEvent{err: finalErr, done: true} }()
+	base, err := executableDirectory()
 	if err != nil {
 		finalErr = err
 		return
 	}
-	proxyPath := filepath.Join(baseDir, "PortableTailscale.exe")
-	freeRDPPath := filepath.Join(baseDir, "freerdp", "sdl-freerdp.exe")
-	for _, required := range []string{proxyPath, freeRDPPath} {
-		if _, err := os.Stat(required); err != nil {
-			finalErr = fmt.Errorf("required program not found: %s", required)
-			return
-		}
-	}
-
-	proxyCtx, stopProxy := context.WithCancel(ctx)
-	defer stopProxy()
-	proxy := exec.CommandContext(proxyCtx, proxyPath, "--json")
-	proxy.Dir = baseDir
-	proxy.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
-	stdout, err := proxy.StdoutPipe()
-	if err != nil {
-		finalErr = fmt.Errorf("capture proxy output: %w", err)
+	freeRDPPath := filepath.Join(base, "freerdp", "sdl-freerdp.exe")
+	if _, err = os.Stat(freeRDPPath); err != nil {
+		finalErr = fmt.Errorf("required program not found: %s", freeRDPPath)
 		return
 	}
-	proxy.Stderr = io.Discard
-	if err := proxy.Start(); err != nil {
-		finalErr = fmt.Errorf("start portable Tailscale: %w", err)
-		return
-	}
-
-	connected, err := waitForProxy(ctx, stdout, emit)
+	events <- sessionEvent{stage: "Waiting for Tailscale", status: "Waiting for Tailscale readiness…"}
+	connected, err := proxy.connection(ctx)
 	if err != nil {
-		stopProxy()
-		_ = proxy.Wait()
 		finalErr = err
 		return
 	}
-
-	bridge, err := startSOCKSBridge(ctx, connected.ProxyURL, rdpAddress(config.target))
+	events <- sessionEvent{stage: "Preparing bridge", status: "Tailscale ready; opening Remote Desktop…"}
+	bridge, err := startSOCKSBridge(ctx, connected.ProxyURL, rdpAddress(config.target), func(err error) { events <- sessionEvent{log: "RDP bridge: " + err.Error()} })
 	if err != nil {
-		finalErr = fmt.Errorf("create local RDP bridge: %w", err)
-		stopProxy()
-		_ = proxy.Wait()
+		finalErr = err
 		return
 	}
 	defer bridge.Close()
-
-	emit("Connected as " + connected.TailscaleIP + "; opening Remote Desktop...")
-	rdpArgs := buildRDPArgs(config, bridge.Address())
-	rdp := exec.CommandContext(ctx, freeRDPPath, "/args-from:stdin")
+	rdpCtx, stopRDP := context.WithCancel(ctx)
+	defer stopRDP()
+	rdp := exec.CommandContext(rdpCtx, freeRDPPath, "/args-from:stdin")
 	rdp.Dir = filepath.Dir(freeRDPPath)
-	rdp.Stdin = strings.NewReader(strings.Join(rdpArgs, "\n") + "\n")
-	rdp.Stdout = io.Discard
-	rdp.Stderr = io.Discard
-	err = rdp.Start()
-	if err != nil {
+	rdp.Stdin = strings.NewReader(strings.Join(buildRDPArgs(config, bridge.Address()), "\n") + "\n")
+	logs := newDiagnosticWriter("FreeRDP", config.password, events)
+	rdp.Stdout = logs
+	rdp.Stderr = logs
+	if err = rdp.Start(); err != nil {
 		finalErr = fmt.Errorf("start FreeRDP: %w", err)
-		stopProxy()
-		_ = proxy.Wait()
 		return
 	}
-	rdpStarted = true
-	err = rdp.Wait()
-	stopProxy()
-	_ = proxy.Wait()
-	if err != nil && ctx.Err() == nil {
-		finalErr = fmt.Errorf("FreeRDP exited with an error: %w", err)
-	} else {
+	events <- sessionEvent{stage: "FreeRDP running", status: "FreeRDP running · Tailscale " + connected.TailscaleIP}
+	done := make(chan error, 1)
+	go func() { done <- rdp.Wait() }()
+	select {
+	case err = <-done:
+		if err != nil {
+			finalErr = fmt.Errorf("FreeRDP exited: %w; open diagnostics with Ctrl+L", err)
+		}
+	case <-proxy.done:
+		stopRDP()
+		<-done
+		finalErr = proxy.exitErr
+	}
+	logs.Flush()
+	if failure := logs.Failure(); failure != nil && finalErr != nil {
+		finalErr = failure
+	}
+	if ctx.Err() != nil {
 		finalErr = ctx.Err()
 	}
 }
@@ -510,9 +694,14 @@ func buildRDPArgs(config sessionConfig, endpoint string) []string {
 		"/server-name:" + serverName(config.target),
 		"/cert:ignore",
 		"/dynamic-resolution",
-		"/log-level:OFF",
+		"/log-level:WARN",
 		"/u:" + config.username,
 		"/p:" + config.password,
+	}
+	if config.options != nil {
+		// Replace the legacy certificate and dynamic-resolution defaults.
+		args = append(args[:2], args[4:]...)
+		args = append(args, optionArgs(*config.options)...)
 	}
 	if config.domain != "" {
 		args = append(args, "/d:"+config.domain)
@@ -539,16 +728,17 @@ func rdpAddress(target string) string {
 	if _, _, err := net.SplitHostPort(target); err == nil {
 		return target
 	}
-	return net.JoinHostPort(target, "3389")
+	return net.JoinHostPort(strings.Trim(target, "[]"), "3389")
 }
 
 type socksBridge struct {
 	listener net.Listener
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup
+	report   func(error)
 }
 
-func startSOCKSBridge(parent context.Context, proxyURL, target string) (*socksBridge, error) {
+func startSOCKSBridge(parent context.Context, proxyURL, target string, report func(error)) (*socksBridge, error) {
 	u, err := url.Parse(proxyURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse SOCKS URL: %w", err)
@@ -572,7 +762,7 @@ func startSOCKSBridge(parent context.Context, proxyURL, target string) (*socksBr
 	}
 
 	ctx, cancel := context.WithCancel(parent)
-	b := &socksBridge{listener: listener, cancel: cancel}
+	b := &socksBridge{listener: listener, cancel: cancel, report: report}
 	b.wg.Add(1)
 	go func() {
 		defer b.wg.Done()
@@ -604,8 +794,11 @@ func (b *socksBridge) Close() {
 
 func (b *socksBridge) forward(ctx context.Context, dialer xproxy.Dialer, local net.Conn, target string) {
 	defer b.wg.Done()
-	remote, err := dialer.Dial("tcp", target)
+	remote, err := dialer.(xproxy.ContextDialer).DialContext(ctx, "tcp", target)
 	if err != nil {
+		if b.report != nil && ctx.Err() == nil {
+			b.report(err)
+		}
 		_ = local.Close()
 		return
 	}

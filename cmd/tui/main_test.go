@@ -24,7 +24,7 @@ func TestBuildRDPArgs(t *testing.T) {
 		"/server-name:home",
 		"/cert:ignore",
 		"/dynamic-resolution",
-		"/log-level:OFF",
+		"/log-level:WARN",
 		"/u:alice",
 		"/p:not-on-command-line",
 		"/d:DOMAIN",
@@ -66,7 +66,7 @@ func TestInitialViewAndToggle(t *testing.T) {
 
 func TestEnterAlwaysAdvancesUntilConnect(t *testing.T) {
 	m := initialModel()
-	for want := 1; want <= connectField; want++ {
+	for _, want := range []int{usernameField, domainField, passwordField, connectField} {
 		updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 		m = updated.(model)
 		if m.focus != want {
@@ -80,7 +80,7 @@ func TestEnterAlwaysAdvancesUntilConnect(t *testing.T) {
 
 func TestArrowNavigationIsConsistent(t *testing.T) {
 	m := initialModel()
-	for want := 1; want < focusCount; want++ {
+	for _, want := range []int{usernameField, domainField, passwordField, connectField} {
 		updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
 		m = updated.(model)
 		if m.focus != want {
